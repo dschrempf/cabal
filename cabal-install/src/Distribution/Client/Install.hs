@@ -1572,6 +1572,7 @@ executeInstallPlan verbosity jobCtl keepGoing useLogFile plan0 installPkg =
     jobCtl
     keepGoing
     depsFailure
+    (const mempty)
     plan0
     $ \pkg -> do
       buildOutcome <- installPkg pkg

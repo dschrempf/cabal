@@ -51,6 +51,8 @@ module Distribution.Client.InstallPlan
     -- * Traversal
   , executionOrder
   , execute
+  , JobCost (..)
+  , chainCosts
   , BuildOutcomes
   , lookupBuildOutcome
 
@@ -97,7 +99,7 @@ import Distribution.Package
   )
 import Distribution.Pretty (defaultStyle)
 import Distribution.Solver.Types.SolverPackage
-import Text.PrettyPrint
+import Text.PrettyPrint hiding ((<>))
 
 import qualified Distribution.Solver.Types.ComponentDeps as CD
 import Distribution.Solver.Types.InstSolverPackage
@@ -899,6 +901,56 @@ executionOrder plan =
 
 -- ------------------------------------------------------------
 
+-- | Estimated work of processing packages, in arbitrary units. Costs add up
+-- when the packages are processed one after another.
+newtype JobCost = JobCost { getJobCost :: Int }
+  deriving (Eq, Ord, Show)
+
+instance Semigroup JobCost where
+  JobCost a <> JobCost b = JobCost (a + b)
+
+instance Monoid JobCost where
+  mempty = JobCost 0
+
+-- | The chain cost of each package: the cost of the package itself plus the
+-- highest chain cost among the packages that depend on it. Only 'Configured'
+-- packages have a cost.
+chainCosts
+  :: forall ipkg srcpkg
+   . IsGraph ipkg srcpkg
+  => (srcpkg -> JobCost)
+  -> GenericInstallPlan ipkg srcpkg
+  -> Map (Key ipkg) JobCost
+chainCosts cost plan = costs
+  where
+    graph = planGraph plan
+
+    -- Lazy in the values, each of which refers to those of its reverse
+    -- dependencies; the graph is acyclic.
+    costs :: Map (Key ipkg) JobCost
+    costs = Map.fromList [(nodeKey pkg, chainCost pkg) | pkg <- Graph.toList graph]
+
+    chainCost :: GenericPlanPackage ipkg srcpkg -> JobCost
+    chainCost pkg =
+      ownCost pkg <> maximum (mempty : map ((costs Map.!) . nodeKey) dependents)
+      where
+        dependents = revDirectDeps plan (nodeKey pkg)
+
+    ownCost :: GenericPlanPackage ipkg srcpkg -> JobCost
+    ownCost (Configured srcpkg) = cost srcpkg
+    ownCost _ = mempty
+
+-- | The priority of each package is its chain cost, so that the package
+-- heading the costliest chain starts first.
+chainCostPriorities
+  :: forall ipkg srcpkg
+   . IsGraph ipkg srcpkg
+  => (srcpkg -> JobCost)
+  -> GenericInstallPlan ipkg srcpkg
+  -> Map (Key ipkg) JobPriority
+chainCostPriorities cost plan =
+  JobPriority . getJobCost <$> chainCosts cost plan
+
 -- | The set of results we get from executing an install plan.
 type BuildOutcomes key failure result = Map key (Either failure result)
 
@@ -935,13 +987,17 @@ execute
   -- ^ Keep going after failure
   -> (srcpkg -> failure)
   -- ^ Value for dependents of failed packages
+  -> (srcpkg -> JobCost)
+  -- ^ Estimated cost of processing the package itself, see 'chainCosts'
   -> GenericInstallPlan ipkg srcpkg
   -> (GenericReadyPackage srcpkg -> m (Either failure result))
   -> m (BuildOutcomes (Key ipkg) failure result)
-execute jobCtl keepGoing depFailure plan installPkg =
+execute jobCtl keepGoing depFailure cost plan installPkg =
   let (newpkgs, processing) = ready plan
    in tryNewTasks mempty False False processing newpkgs
   where
+    priorities = chainCostPriorities cost plan
+
     tryNewTasks
       :: Key srcpkg ~ key
       => BuildOutcomes key failure result
@@ -968,7 +1024,7 @@ execute jobCtl keepGoing depFailure plan installPkg =
       | otherwise =
           do
             sequence_
-              [ spawnJob jobCtl $ do
+              [ spawnJobWithPriority jobCtl (priorities Map.! nodeKey pkg) $ do
                 result <- installPkg pkg
                 return (nodeKey pkg, result)
               | pkg <- newpkgs

@@ -10,10 +10,13 @@
 -- A job control concurrency abstraction
 module Distribution.Client.JobControl
   ( JobControl
+  , JobPriority (..)
+  , defaultJobPriority
   , newSerialJobControl
   , newParallelJobControl
   , newSemaphoreJobControl
   , spawnJob
+  , spawnJobWithPriority
   , collectJob
   , remainingJobs
   , cancelJobs
@@ -37,10 +40,12 @@ import Prelude ()
 
 import Control.Concurrent (forkIO, forkIOWithUnmask, threadDelay)
 import Control.Concurrent.MVar
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
 import Control.Concurrent.STM.TChan
 import Control.Exception (bracket, bracket_, finally, mask_, try)
 import Control.Monad (forever, replicateM_)
+import qualified Data.Map.Strict as Map
+import Data.Ord (Down (..))
 import Distribution.Client.Compat.Semaphore
 import Distribution.Client.Utils (numberOfProcessors)
 import Distribution.Compat.Stack
@@ -52,8 +57,10 @@ import System.Semaphore
 -- | A simple concurrency abstraction. Jobs can be spawned and can complete
 -- in any order. This allows both serial and parallel implementations.
 data JobControl m a = JobControl
-  { spawnJob :: m a -> m ()
-  -- ^ Add a new job to the pool of jobs
+  { spawnJobWithPriority :: JobPriority -> m a -> m ()
+  -- ^ Add a new job to the pool of jobs. Job controls that run jobs
+  -- concurrently start the queued job of highest priority first; the serial
+  -- job control ignores the priority.
   , collectJob :: m a
   -- ^ Wait until one job is complete
   , remainingJobs :: m Bool
@@ -71,6 +78,19 @@ data JobControl m a = JobControl
   -- if one is available for that job control type.
   }
 
+-- | Scheduling priority of a job. A job of higher priority starts first; among
+-- queued jobs of equal priority, the first spawned starts first.
+newtype JobPriority = JobPriority Int
+  deriving (Eq, Ord, Show)
+
+-- | The priority of jobs added with 'spawnJob'.
+defaultJobPriority :: JobPriority
+defaultJobPriority = JobPriority 0
+
+-- | Add a new job to the pool of jobs, at 'defaultJobPriority'.
+spawnJob :: JobControl m a -> m a -> m ()
+spawnJob jobCtl = spawnJobWithPriority jobCtl defaultJobPriority
+
 -- | Make a 'JobControl' that executes all jobs serially and in order.
 -- It only executes jobs on demand when they are collected, not eagerly.
 --
@@ -80,7 +100,7 @@ newSerialJobControl = do
   qVar <- newTChanIO
   return
     JobControl
-      { spawnJob = spawn qVar
+      { spawnJobWithPriority = const (spawn qVar)
       , collectJob = collect qVar
       , remainingJobs = remaining qVar
       , cancelJobs = cancel qVar
@@ -114,7 +134,7 @@ newParallelJobControl n
   | n < 1 || n > 1000 =
       error $ "newParallelJobControl: not a sensible number of jobs: " ++ show n
 newParallelJobControl maxJobLimit = do
-  inqVar <- newTChanIO
+  inqVar <- newTVarIO emptyJobQueue
   outqVar <- newTChanIO
   countVar <- newTVarIO 0
   replicateM_ maxJobLimit $
@@ -122,7 +142,7 @@ newParallelJobControl maxJobLimit = do
       worker inqVar outqVar
   return
     JobControl
-      { spawnJob = spawn inqVar countVar
+      { spawnJobWithPriority = spawn inqVar countVar
       , collectJob = collect outqVar countVar
       , remainingJobs = remaining countVar
       , cancelJobs = cancel inqVar countVar
@@ -130,18 +150,18 @@ newParallelJobControl maxJobLimit = do
       , jobControlSemaphore = Nothing
       }
   where
-    worker :: TChan (IO a) -> TChan (Either SomeException a) -> IO ()
+    worker :: TVar (JobQueue (IO a)) -> TChan (Either SomeException a) -> IO ()
     worker inqVar outqVar =
       forever $ do
-        job <- atomically $ readTChan inqVar
+        job <- atomically $ takeJob inqVar
         res <- try job
         atomically $ writeTChan outqVar res
 
-    spawn :: TChan (IO a) -> TVar Int -> IO a -> IO ()
-    spawn inqVar countVar job =
+    spawn :: TVar (JobQueue (IO a)) -> TVar Int -> JobPriority -> IO a -> IO ()
+    spawn inqVar countVar prio job =
       atomically $ do
         modifyTVar' countVar (+ 1)
-        writeTChan inqVar job
+        modifyTVar' inqVar (pushJob prio job)
 
     collect :: TChan (Either SomeException a) -> TVar Int -> IO a
     collect outqVar countVar = do
@@ -153,11 +173,45 @@ newParallelJobControl maxJobLimit = do
     remaining :: TVar Int -> IO Bool
     remaining countVar = fmap (/= 0) $ atomically $ readTVar countVar
 
-    cancel :: TChan (IO a) -> TVar Int -> IO ()
+    cancel :: TVar (JobQueue (IO a)) -> TVar Int -> IO ()
     cancel inqVar countVar =
       atomically $ do
-        xs <- readAllTChan inqVar
-        modifyTVar' countVar (subtract (length xs))
+        n <- dropJobs inqVar
+        modifyTVar' countVar (subtract n)
+
+-- | Jobs waiting to start, ordered by descending priority, then by the
+-- sequence number given when spawned.
+data JobQueue a = JobQueue
+  { jobQueueNextSeqNo :: !Int
+  , jobQueueJobs :: !(Map.Map (Down JobPriority, Int) a)
+  }
+
+emptyJobQueue :: JobQueue a
+emptyJobQueue = JobQueue 0 Map.empty
+
+nullJobQueue :: JobQueue a -> Bool
+nullJobQueue = Map.null . jobQueueJobs
+
+pushJob :: JobPriority -> a -> JobQueue a -> JobQueue a
+pushJob prio job (JobQueue n jobs) =
+  JobQueue{jobQueueNextSeqNo = n + 1, jobQueueJobs = Map.insert (Down prio, n) job jobs}
+
+tryTakeJob :: TVar (JobQueue a) -> STM (Maybe a)
+tryTakeJob qVar = do
+  q <- readTVar qVar
+  for (Map.minView (jobQueueJobs q)) $ \(job, jobs') ->
+    job <$ writeTVar qVar q{jobQueueJobs = jobs'}
+
+-- | Take the next job, blocking while the queue is empty.
+takeJob :: TVar (JobQueue a) -> STM a
+takeJob qVar = maybe retry return =<< tryTakeJob qVar
+
+-- | Drop all queued jobs, returning how many there were.
+dropJobs :: TVar (JobQueue a) -> STM Int
+dropJobs qVar = do
+  q <- readTVar qVar
+  writeTVar qVar q{jobQueueJobs = Map.empty}
+  return (Map.size (jobQueueJobs q))
 
 readAllTChan :: TChan a -> STM [a]
 readAllTChan qvar = go []
@@ -196,12 +250,12 @@ newSemaphoreJobControl verbosity maxJobLimit = do
           ++ show maxJobLimit
           ++ " slots."
       outqVar <- newTChanIO
-      inqVar <- newTChanIO
+      inqVar <- newTVarIO emptyJobQueue
       countVar <- newTVarIO 0
       void (forkIO (worker sem inqVar outqVar))
       return
         JobControl
-          { spawnJob = spawn inqVar countVar
+          { spawnJobWithPriority = spawn inqVar countVar
           , collectJob = collect outqVar countVar
           , remainingJobs = remaining countVar
           , cancelJobs = cancel inqVar countVar
@@ -209,17 +263,25 @@ newSemaphoreJobControl verbosity maxJobLimit = do
           , jobControlSemaphore = Just (semaphoreIdentifier (clientSemaphoreName sem))
           }
   where
-    worker :: ClientSemaphore -> TChan (IO a) -> TChan (Either SomeException a) -> IO ()
+    worker :: ClientSemaphore -> TVar (JobQueue (IO a)) -> TChan (Either SomeException a) -> IO ()
     worker sem inqVar outqVar =
       forever $ do
-        job <- atomically $ readTChan inqVar
+        atomically $ check . not . nullJobQueue =<< readTVar inqVar
+        -- Choose the job only once we hold a token: a job of higher priority
+        -- may be spawned while we wait for it.
+        --
         -- mask so that the fork happens atomically with the acquire.
         mask_ $ do
           -- waitOnSemaphore is interruptible under mask_
           tok <- waitOnSemaphore sem
-          void $ forkIOWithUnmask $ \unmask -> do
-            res <- try (unmask job) `finally` releaseSemaphoreToken tok
-            atomically $ writeTChan outqVar res
+          mjob <- atomically $ tryTakeJob inqVar
+          case mjob of
+            -- cancelJobs emptied the queue while we waited
+            Nothing -> releaseSemaphoreToken tok
+            Just job ->
+              void $ forkIOWithUnmask $ \unmask -> do
+                res <- try (unmask job) `finally` releaseSemaphoreToken tok
+                atomically $ writeTChan outqVar res
         -- Try to give GHC enough time to compute the module graph and then
         -- request some additional capabilities if it can make use of them. The
         -- ideal situation is that we have 1 GHC process running which has taken
@@ -229,11 +291,11 @@ newSemaphoreJobControl verbosity maxJobLimit = do
         -- which isn't too big and not too small but also, not scientifically.
         threadDelay 250000
 
-    spawn :: TChan (IO a) -> TVar Int -> IO a -> IO ()
-    spawn inqVar countVar job =
+    spawn :: TVar (JobQueue (IO a)) -> TVar Int -> JobPriority -> IO a -> IO ()
+    spawn inqVar countVar prio job =
       atomically $ do
         modifyTVar' countVar (+ 1)
-        writeTChan inqVar job
+        modifyTVar' inqVar (pushJob prio job)
 
     collect :: TChan (Either SomeException a) -> TVar Int -> IO a
     collect outqVar countVar = do
@@ -245,11 +307,11 @@ newSemaphoreJobControl verbosity maxJobLimit = do
     remaining :: TVar Int -> IO Bool
     remaining countVar = fmap (/= 0) $ atomically $ readTVar countVar
 
-    cancel :: TChan (IO a) -> TVar Int -> IO ()
+    cancel :: TVar (JobQueue (IO a)) -> TVar Int -> IO ()
     cancel inqVar countVar =
       atomically $ do
-        xs <- readAllTChan inqVar
-        modifyTVar' countVar (subtract (length xs))
+        n <- dropJobs inqVar
+        modifyTVar' countVar (subtract n)
 
 -------------------------
 -- Job limits and locks

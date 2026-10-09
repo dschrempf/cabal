@@ -6,10 +6,14 @@ import Distribution.Client.Compat.Prelude
 import Prelude ()
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (try)
 import Control.Monad (replicateM, replicateM_)
-import Data.IORef (atomicModifyIORef, newIORef)
+import Data.IORef (atomicModifyIORef, newIORef, readIORef)
+import Data.List (sortOn)
+import Data.Ord (Down (..))
 import qualified Data.Set as Set
+import Distribution.Verbosity (defaultVerbosityHandles, mkVerbosity, silent)
 
 import Test.Tasty
 import Test.Tasty.QuickCheck hiding (collect)
@@ -33,6 +37,11 @@ tests =
       , testProperty "concurrent jobs" prop_concurrent_parallel
       , testProperty "cancel" prop_cancel_parallel
       , testProperty "exceptions" prop_exception_parallel
+      , testProperty "priority" prop_priority_parallel
+      ]
+  , testGroup
+      "semaphore"
+      [ testProperty "priority" prop_priority_semaphore
       ]
   ]
 
@@ -201,3 +210,39 @@ prop_exception jobCtl xs = do
       Left (TestException n) -> Left n
       Right n -> Right n
   return (sort xs == sort xs')
+
+prop_priority_parallel :: [Int] -> Property
+prop_priority_parallel prios =
+  ioProperty $ do
+    jobCtl <- newParallelJobControl 1
+    prop_priority jobCtl (return ()) prios
+
+-- Each job started costs the semaphore job control a 0.25s delay, so test a
+-- single example. Pause longer than that before each spawn: the dispatcher
+-- then waits for a token with a job of lower priority already queued.
+prop_priority_semaphore :: Property
+prop_priority_semaphore =
+  once $ ioProperty $ withJobControl (newSemaphoreJobControl verbosity 1) $ \jobCtl ->
+    prop_priority jobCtl (threadDelay 300000) [1, 3, 2]
+  where
+    verbosity = mkVerbosity defaultVerbosityHandles silent
+
+-- | Jobs queued while the only slot is taken start by descending priority,
+-- then in the order spawned.
+prop_priority :: JobControl IO () -> IO () -> [Int] -> IO Property
+prop_priority jobCtl pause prios = do
+  started <- newEmptyMVar
+  release <- newEmptyMVar
+  startOrderRef <- newIORef []
+  spawnJob jobCtl (putMVar started () >> takeMVar release)
+  takeMVar started
+  for_ jobs $ \(i, prio) -> do
+    pause
+    spawnJobWithPriority jobCtl (JobPriority prio) $
+      atomicModifyIORef startOrderRef (\is -> (i : is, ()))
+  putMVar release ()
+  replicateM_ (length jobs + 1) (collectJob jobCtl)
+  startOrder <- reverse <$> readIORef startOrderRef
+  return (startOrder === map fst (sortOn (\(i, prio) -> (Down prio, i)) jobs))
+  where
+    jobs = zip [0 :: Int ..] prios

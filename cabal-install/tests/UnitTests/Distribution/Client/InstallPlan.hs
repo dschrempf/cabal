@@ -4,7 +4,7 @@ module UnitTests.Distribution.Client.InstallPlan (tests) where
 
 import Distribution.Client.Compat.Prelude
 
-import Distribution.Client.InstallPlan (GenericInstallPlan, IsGraph)
+import Distribution.Client.InstallPlan (GenericInstallPlan, IsGraph, JobCost (..))
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.JobControl
 import Distribution.Client.Types
@@ -38,6 +38,7 @@ tests =
   , testProperty "execute serial" prop_execute_serial
   , testProperty "execute parallel" prop_execute_parallel
   , testProperty "execute/executionOrder" prop_execute_vs_executionOrder
+  , testProperty "chainCosts" prop_chainCosts
   ]
 
 prop_reverseTopologicalOrder :: TestInstallPlan -> Bool
@@ -86,12 +87,13 @@ executeTestInstallPlan
   -> TestInstallPlan
   -> (TestPkg -> IO ())
   -> IO [UnitId]
-executeTestInstallPlan jobCtl (TestInstallPlan plan _ _ _) visit = do
+executeTestInstallPlan jobCtl (TestInstallPlan plan _ toVertex _) visit = do
   resultsRef <- newIORef []
   _ <- InstallPlan.execute
     jobCtl
     False
     (const ())
+    (testPkgCost toVertex)
     plan
     $ \(ReadyPackage pkg) -> do
       visit pkg
@@ -107,6 +109,26 @@ prop_execute_vs_executionOrder tplan@(TestInstallPlan plan _ _ _) =
     pkgids <- executeTestInstallPlan jobCtl tplan (\_ -> return ())
     let pkgids' = map installedUnitId (InstallPlan.executionOrder plan)
     return (pkgids == pkgids')
+
+-- | A package's chain cost is its own cost plus the highest chain cost among
+-- the packages that depend on it.
+prop_chainCosts :: TestInstallPlan -> Bool
+prop_chainCosts (TestInstallPlan plan graph toVertex fromVertex) =
+  and
+    [ chainCost v == cost v + maximum (0 : map chainCost (dependents ! v))
+    | v <- vertices graph
+    ]
+  where
+    chainCosts = InstallPlan.chainCosts (testPkgCost toVertex) plan
+    chainCost v = let JobCost c = chainCosts Map.! fromVertex v in c
+    dependents = transposeG graph
+    cost v = case InstallPlan.lookup plan (fromVertex v) of
+      Just (InstallPlan.Configured pkg) -> let JobCost c = testPkgCost toVertex pkg in c
+      _ -> 0
+
+-- | A cost that differs between packages.
+testPkgCost :: (UnitId -> Vertex) -> TestPkg -> JobCost
+testPkgCost toVertex pkg = JobCost (1 + toVertex (installedUnitId pkg) `mod` 3)
 
 --------------------------
 -- Property helper utils

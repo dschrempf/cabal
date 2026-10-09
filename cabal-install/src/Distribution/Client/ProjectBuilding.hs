@@ -54,6 +54,7 @@ import Distribution.Client.InstallPlan
   ( GenericInstallPlan
   , GenericPlanPackage
   , IsGraph
+  , JobCost (..)
   )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.JobControl
@@ -71,7 +72,11 @@ import Distribution.Simple.Program
 import qualified Distribution.Simple.Register as Cabal
 
 import Distribution.Compat.Graph (IsNode (..))
+import Distribution.Compat.Lens (view)
 import Distribution.Simple.Utils
+import Distribution.Types.Component (componentName)
+import Distribution.Types.PackageDescription (enabledComponents)
+import Distribution.Types.PackageDescription.Lens (componentModules)
 import Distribution.Utils.Path hiding
   ( (<.>)
   , (</>)
@@ -395,6 +400,7 @@ rebuildTargets
                 jobControl
                 keepGoing
                 (BuildFailure Nothing . DependentFailed . packageId)
+                estimatedBuildCost
                 installPlan
                 $ \pkg ->
                   -- TODO: review exception handling
@@ -468,6 +474,22 @@ rebuildTargets
           isRemote (RepoTarballPackage{}) = True
           isRemote (RemoteSourceRepoPackage _ _) = True
           isRemote _ = False
+
+-- | Estimated cost of building a unit: its number of modules, plus a
+-- constant for the steps every unit takes (configure, link, register).
+estimatedBuildCost :: ElaboratedConfiguredPackage -> JobCost
+estimatedBuildCost elab = JobCost (unitOverhead + length modules)
+  where
+    unitOverhead = 1
+    pkgDescr = elabPkgDescription elab
+    modules = case elabPkgOrComp elab of
+      ElabPackage _ ->
+        concatMap
+          (modulesOf . componentName)
+          (enabledComponents pkgDescr (elabEnabledSpec elab))
+      -- No component name: the package's Setup script.
+      ElabComponent comp -> foldMap modulesOf (compComponentName comp)
+    modulesOf cname = view (componentModules cname) pkgDescr
 
 {- Note [Per-project InstalledPackageIndex]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
